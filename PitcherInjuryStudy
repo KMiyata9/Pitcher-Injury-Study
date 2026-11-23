@@ -1,0 +1,697 @@
+# MLB pitcher workload and arm-injury study (improved version)
+#
+# Improvements built in:
+#   1. Starters and relievers are analyzed separately.
+#   2. Workload spikes: recent 7/14-day pitches vs the 28-day norm, plus change vs the prior 28 days.
+#   3. Injury history: previous arm injured-list placements.
+#   4. Age and season workload (pitches so far this season, last season's total).
+#   5. Matched controls (risk-set design): every injured pitcher is compared with healthy pitchers
+#      of the same role, who pitched on the SAME date and are closest in age.
+#   6. Mixed-effects model (random intercept per pitcher) plus a matched-set (conditional) logistic model.
+#   7. Validation on other seasons: train on two seasons, test on the third.
+#
+# Setup:   pip install pybaseball pandas numpy requests scipy scikit-learn statsmodels
+# Run:     put this file in the SAME project folder as your earlier script (the one that created the
+#          "mlb_data" folder). It reuses the saved Statcast weeks, so it does not re-download pitches.
+# Output:  files in mlb_data/study_results/  (open summary.txt first)
+
+import os
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+import requests
+from scipy import stats
+
+warnings.filterwarnings("ignore")
+
+# ------------------------------------------------------------------ settings (EDIT HERE)
+SEASONS = [2025]       # seasons to study (MLB regular season only)
+DEFAULT_START = "03-15"            # keep these the same as your earlier script so saved weeks are reused
+DEFAULT_END = "10-05"
+CUSTOM_DATES = {}                  # e.g. {2025: ("2025-04-01", "2025-06-30")}
+
+OUT_DIR = "mlb_data"
+CHUNK_DIR = os.path.join(OUT_DIR, "statcast_chunks")
+RESULT_DIR = os.path.join(OUT_DIR, "study_results")
+
+K_CONTROLS = 5                     # healthy comparison pitchers per injured pitcher
+MIN_CONTROLS = 2                   # skip an injury if fewer healthy comparison pitchers exist
+MAX_GAP_DAYS = 10                  # injury counts only if the IL move is within 10 days of his last outing
+IL_CLEAR_DAYS = 21                 # controls must have NO injured-list move in the 21 days after the index date
+MIN_HISTORY_DAYS = 28              # need 28 days of season history before the index date
+MIN_STARTS_FOR_STARTER = 3         # role rule: 3+ starts and starts are at least half of appearances
+HIGH_VELO_MPH = 95.0
+SEED = 42
+
+STATCAST_WINDOW = {y: CUSTOM_DATES.get(y, (f"{y}-{DEFAULT_START}", f"{y}-{DEFAULT_END}")) for y in SEASONS}
+HISTORY_YEAR = min(SEASONS) - 1    # one extra year of injured-list moves, used only for injury history
+
+KEEP = ["game_pk", "game_date", "game_type", "inning_topbot", "at_bat_number", "pitch_number",
+        "pitcher", "batter", "pitch_type", "release_speed", "release_spin_rate",
+        "release_pos_x", "release_pos_z", "release_extension", "pfx_x", "pfx_z",
+        "delta_run_exp", "n_thruorder_pitcher", "p_throws", "stand"]
+TEXT_COLS = ["game_date", "game_type", "inning_topbot", "pitch_type", "p_throws", "stand"]
+NUM_COLS = [c for c in KEEP if c not in TEXT_COLS]
+
+MLB_TEAMS = {
+    "Arizona Diamondbacks", "Athletics", "Oakland Athletics", "Atlanta Braves", "Baltimore Orioles",
+    "Boston Red Sox", "Chicago Cubs", "Chicago White Sox", "Cincinnati Reds", "Cleveland Guardians",
+    "Colorado Rockies", "Detroit Tigers", "Houston Astros", "Kansas City Royals", "Los Angeles Angels",
+    "Los Angeles Dodgers", "Miami Marlins", "Milwaukee Brewers", "Minnesota Twins", "New York Mets",
+    "New York Yankees", "Philadelphia Phillies", "Pittsburgh Pirates", "San Diego Padres",
+    "San Francisco Giants", "Seattle Mariners", "St. Louis Cardinals", "Tampa Bay Rays",
+    "Texas Rangers", "Toronto Blue Jays", "Washington Nationals",
+}
+
+# Variables used in the models (kept small on purpose so the models stay stable)
+CORE_FEATURES = ["pitches_28d", "acwr_7d_28d", "hv_pitches_14d", "days_since_last_appearance",
+                 "avg_pitches_per_outing_28d", "season_pitches_to_date", "age", "had_prior_arm_il"]
+FEATURE_SETS = {
+    "A_workload_only": CORE_FEATURES,
+    "B_workload_plus_velocity_change": CORE_FEATURES + ["fb_velo_change_mph"],
+}
+# Extra variables shown in the descriptive comparison
+DESCRIBE_EXTRA = ["pitches_7d", "pitches_14d", "pitches_21d", "appearances_7d", "appearances_14d",
+                  "acwr_14d_28d", "workload_change_28d", "workload_change_pct", "season_appearances_to_date",
+                  "prev_season_pitches", "prior_arm_il_count", "pitches_on_index_day"]
+
+
+# ================================================================== 1. DATA LOADING
+def pull_statcast_season(year, chunk_days=7, retries=3):
+    from pybaseball import statcast, cache
+    cache.enable()
+    os.makedirs(CHUNK_DIR, exist_ok=True)
+    start, end = STATCAST_WINDOW[year]
+    for d in pd.date_range(start, end, freq=f"{chunk_days}D"):
+        s = d.strftime("%Y-%m-%d")
+        e = min(d + pd.Timedelta(days=chunk_days - 1), pd.Timestamp(end)).strftime("%Y-%m-%d")
+        path = os.path.join(CHUNK_DIR, f"{s}_{e}.csv.gz")
+        if os.path.exists(path) or os.path.exists(path + ".empty"):
+            continue
+        chunk = None
+        for attempt in range(retries):
+            try:
+                chunk = statcast(start_dt=s, end_dt=e)
+                break
+            except Exception as err:
+                print(f"  retry {attempt + 1} for {s}..{e}: {err}")
+                time.sleep(10 * (attempt + 1))
+        if chunk is None or chunk.empty:
+            open(path + ".empty", "w").close()
+            continue
+        chunk = chunk[KEEP].copy()
+        chunk = chunk[chunk["game_type"] == "R"]
+        for c in NUM_COLS:
+            chunk[c] = pd.to_numeric(chunk[c], errors="coerce").to_numpy(dtype="float64", na_value=np.nan)
+        for c in TEXT_COLS:
+            chunk[c] = chunk[c].astype(str).astype(object)
+        chunk.to_csv(path, index=False, compression="gzip")
+        print(f"  saved {s}..{e}: {len(chunk):,} pitches")
+
+
+def load_statcast():
+    files = sorted(f for f in os.listdir(CHUNK_DIR) if f.endswith(".csv.gz"))
+    frames = [pd.read_csv(os.path.join(CHUNK_DIR, f)) for f in files]
+    sc = pd.concat(frames, ignore_index=True)
+    for c in NUM_COLS:
+        sc[c] = pd.to_numeric(sc[c], errors="coerce").astype("float64")
+    sc = sc.dropna(subset=["game_pk", "at_bat_number", "pitch_number", "pitcher"])
+    sc = sc.drop_duplicates(["game_pk", "at_bat_number", "pitch_number"])
+    for c in ["game_pk", "at_bat_number", "pitcher"]:
+        sc[c] = sc[c].astype("int64")
+    sc["game_date"] = pd.to_datetime(sc["game_date"]).astype("datetime64[ns]")
+    sc["season"] = sc["game_date"].dt.year
+    sc = sc[sc["season"].isin(SEASONS)]
+    return sc.sort_values(["game_pk", "at_bat_number", "pitch_number"]).reset_index(drop=True)
+
+
+API = "https://statsapi.mlb.com/api/v1/transactions"
+ARM = r"elbow|shoulder|forearm|ucl|tommy john|triceps|biceps|flexor|rotator|neuropathy|thoracic outlet|\barm\b"
+AMBIG = r"\blat\b|teres|scapula|\bback\b|neck|discomfort|fatigue"
+NEW_IL = r"placed .* on the (?:10|15|60)-day injured list"
+
+
+def pull_transactions(start, end, step_days=14, retries=3):
+    rows = []
+    for d in pd.date_range(start, end, freq=f"{step_days}D"):
+        s = d.strftime("%Y-%m-%d")
+        e = min(d + pd.Timedelta(days=step_days - 1), pd.Timestamp(end)).strftime("%Y-%m-%d")
+        for attempt in range(retries):
+            try:
+                r = requests.get(API, params={"startDate": s, "endDate": e}, timeout=30)
+                r.raise_for_status()
+                break
+            except Exception as err:
+                print(f"  retry {attempt + 1} for transactions {s}..{e}: {err}")
+                time.sleep(5 * (attempt + 1))
+        else:
+            continue
+        for t in r.json().get("transactions", []):
+            rows.append({"date": t.get("date"), "effective_date": t.get("effectiveDate"),
+                         "team": (t.get("toTeam") or t.get("fromTeam") or {}).get("name"),
+                         "player_id": (t.get("person") or {}).get("id"),
+                         "player_name": (t.get("person") or {}).get("fullName"),
+                         "text": t.get("description")})
+        time.sleep(0.5)
+    return pd.DataFrame(rows)
+
+
+def label_injuries(tx):
+    t = tx.copy()
+    t = t[t["team"].isin(MLB_TEAMS)]
+    txt = t["text"].fillna("")
+    t = t[txt.str.lower().str.contains(NEW_IL)].copy()
+    txt = t["text"].fillna("")
+    t["injury_text"] = txt.str.extract(r"injured list(?: retroactive to [A-Za-z]+ \d+, \d{4})?\.\s*(.*)$")[0]
+    inj = t["injury_text"].fillna("").str.lower()
+    t["arm_label"] = "non-arm"
+    t.loc[inj.str.contains(AMBIG), "arm_label"] = "ambiguous (review)"
+    t.loc[inj.str.contains(ARM), "arm_label"] = "arm"
+    t.loc[inj.eq(""), "arm_label"] = "unspecified"
+    retro = txt.str.extract(r"retroactive to ([A-Za-z]+ \d+, \d{4})")[0]
+    t["event_date"] = pd.to_datetime(retro, errors="coerce").fillna(pd.to_datetime(t["date"], errors="coerce"))
+    t = t.dropna(subset=["player_id", "event_date"])
+    t["pitcher_id"] = t["player_id"].astype("int64")
+    t["event_date"] = pd.to_datetime(t["event_date"]).astype("datetime64[ns]")
+    return t.drop_duplicates(["pitcher_id", "event_date", "injury_text"]).reset_index(drop=True)
+
+
+def load_injuries():
+    """Injured-list moves for the history year plus all study seasons (saved per year so reruns are fast)."""
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    frames = []
+    for y in range(HISTORY_YEAR, max(SEASONS) + 1):
+        path = os.path.join(OUT_DIR, f"tx_raw_{y}.csv")
+        if os.path.exists(path):
+            raw = pd.read_csv(path)
+        else:
+            print(f"Pulling injured-list moves for {y} ...")
+            raw = pull_transactions(f"{y}-03-01", f"{y}-10-31")
+            raw.to_csv(path, index=False)
+        frames.append(raw)
+    il = label_injuries(pd.concat(frames, ignore_index=True))
+    il.to_csv(os.path.join(OUT_DIR, "il_all_labeled.csv"), index=False)
+    return il
+
+
+def get_birthdates(ids):
+    """Birth dates from the MLB Stats API (saved to disk). Returns {player_id: Timestamp}."""
+    path = os.path.join(OUT_DIR, "player_birthdates.csv")
+    cache = {}
+    if os.path.exists(path):
+        c = pd.read_csv(path)
+        cache = {int(a): pd.Timestamp(b) for a, b in zip(c["player_id"], c["birth_date"])}
+    missing = [int(i) for i in ids if int(i) not in cache]
+    for i in range(0, len(missing), 100):
+        batch = missing[i:i + 100]
+        try:
+            r = requests.get("https://statsapi.mlb.com/api/v1/people",
+                             params={"personIds": ",".join(map(str, batch))}, timeout=30)
+            r.raise_for_status()
+            for p in r.json().get("people", []):
+                if p.get("birthDate"):
+                    cache[int(p["id"])] = pd.Timestamp(p["birthDate"])
+        except Exception as err:
+            print(f"  could not fetch birth dates for a batch ({err}); age will be missing for them")
+        time.sleep(0.3)
+    if cache:
+        pd.DataFrame({"player_id": list(cache.keys()), "birth_date": list(cache.values())}).to_csv(path, index=False)
+    return cache
+
+
+# ================================================================== 2. ROLES AND DAILY WORKLOAD TABLE
+def make_roles(sc):
+    first = sc.groupby(["game_pk", "inning_topbot"])["pitcher"].first().rename("pitcher").reset_index()
+    first = first.merge(sc[["game_pk", "season"]].drop_duplicates("game_pk"), on="game_pk")
+    starts = first.groupby(["pitcher", "season"]).size().rename("starts")
+    apps = sc.groupby(["pitcher", "season"])["game_pk"].nunique().rename("apps")
+    roles = pd.concat([apps, starts], axis=1).fillna(0).reset_index()
+    is_starter = (roles["starts"] >= MIN_STARTS_FOR_STARTER) & (roles["starts"] >= 0.5 * roles["apps"])
+    roles["role"] = np.where(is_starter, "Starter", "Reliever")
+    return roles[["pitcher", "season", "role", "starts", "apps"]]
+
+
+def add_trailing(grid, col, n, name, offset=0):
+    """Sum of `col` over the n days that end (offset + 1) days before each row's date.
+    Never includes the row's own day, so nothing from the index day leaks into the predictors."""
+    keys = [grid["pitcher"], grid["season"]]
+    cs = grid.groupby(["pitcher", "season"])[col].cumsum()
+    a = cs.groupby(keys).shift(1 + offset)
+    b = cs.groupby(keys).shift(1 + offset + n).fillna(0.0)
+    pos = grid.groupby(["pitcher", "season"]).cumcount()
+    grid[name] = (a - b).where(pos >= n + offset)
+
+
+def build_daily_grid(sc):
+    sc = sc.copy()
+    sc["hv"] = (sc["release_speed"] >= HIGH_VELO_MPH).astype(int)
+    is_fb = sc["pitch_type"].isin(["FF", "SI"]) & sc["release_speed"].notna()
+    sc["fb_n"] = is_fb.astype(int)
+    sc["fb_vsum"] = np.where(is_fb, sc["release_speed"], 0.0)
+    daily = sc.groupby(["pitcher", "game_date"]).agg(
+        pitches=("pitch_number", "size"), hv=("hv", "sum"),
+        fb_n=("fb_n", "sum"), fb_vsum=("fb_vsum", "sum")).reset_index()
+
+    parts = []
+    for season in SEASONS:
+        s = sc[sc["season"] == season]
+        if s.empty:
+            continue
+        days = pd.date_range(s["game_date"].min(), s["game_date"].max())
+        ids = np.sort(s["pitcher"].unique())
+        g = pd.DataFrame({"pitcher": np.repeat(ids, len(days)), "game_date": np.tile(days.values, len(ids))})
+        g["season"] = season
+        parts.append(g)
+    grid = pd.concat(parts, ignore_index=True)
+    grid = grid.merge(daily, on=["pitcher", "game_date"], how="left")
+    for c in ["pitches", "hv", "fb_n", "fb_vsum"]:
+        grid[c] = grid[c].fillna(0.0)
+    grid["appearance"] = (grid["pitches"] > 0).astype(int)
+    grid = grid.sort_values(["pitcher", "season", "game_date"]).reset_index(drop=True)
+
+    for n in (7, 14, 21, 28):
+        add_trailing(grid, "pitches", n, f"pitches_{n}d")
+    add_trailing(grid, "hv", 14, "hv_pitches_14d")
+    for n in (7, 14, 28):
+        add_trailing(grid, "appearance", n, f"appearances_{n}d")
+    add_trailing(grid, "pitches", 28, "pitches_prev28d", offset=28)       # the 28 days before the last 28
+    add_trailing(grid, "fb_n", 14, "fb_n_14d")
+    add_trailing(grid, "fb_vsum", 14, "fb_vsum_14d")
+    add_trailing(grid, "fb_n", 31, "fb_n_base", offset=14)                 # days 15-45 before
+    add_trailing(grid, "fb_vsum", 31, "fb_vsum_base", offset=14)
+
+    # 2. workload spikes
+    grid["acwr_7d_28d"] = grid["pitches_7d"] / (grid["pitches_28d"] / 4.0).replace(0, np.nan)
+    grid["acwr_14d_28d"] = grid["pitches_14d"] / (grid["pitches_28d"] / 2.0).replace(0, np.nan)
+    grid["workload_change_28d"] = grid["pitches_28d"] - grid["pitches_prev28d"]
+    grid["workload_change_pct"] = grid["workload_change_28d"] / grid["pitches_prev28d"].replace(0, np.nan)
+    grid["avg_pitches_per_outing_28d"] = grid["pitches_28d"] / grid["appearances_28d"].replace(0, np.nan)
+
+    # velocity change: recent 14 days vs days 15-45 before (needs enough fastballs in both)
+    recent = grid["fb_vsum_14d"] / grid["fb_n_14d"].replace(0, np.nan)
+    base = grid["fb_vsum_base"] / grid["fb_n_base"].replace(0, np.nan)
+    ok = (grid["fb_n_14d"] >= 10) & (grid["fb_n_base"] >= 30)
+    grid["fb_velo_change_mph"] = (recent - base).where(ok)
+
+    # 4. season workload to date (through yesterday)
+    keys = [grid["pitcher"], grid["season"]]
+    grid["season_pitches_to_date"] = grid.groupby(["pitcher", "season"])["pitches"].cumsum().groupby(keys).shift(1).fillna(0.0)
+    grid["season_appearances_to_date"] = grid.groupby(["pitcher", "season"])["appearance"].cumsum().groupby(keys).shift(1).fillna(0.0)
+
+    # rest
+    grid["app_date"] = grid["game_date"].where(grid["appearance"] == 1)
+    grid["last_app"] = grid.groupby(["pitcher", "season"])["app_date"].ffill()
+    grid["last_app_prev"] = grid.groupby(["pitcher", "season"])["last_app"].shift(1)
+    grid["days_since_last_appearance"] = (grid["game_date"] - grid["last_app_prev"]).dt.days
+    grid = grid.drop(columns=["app_date", "last_app", "last_app_prev", "fb_n_14d", "fb_vsum_14d",
+                              "fb_n_base", "fb_vsum_base", "pitches_prev28d"])
+
+    # last season's total pitches
+    tot = grid.groupby(["pitcher", "season"])["pitches"].sum().rename("prev_season_pitches").reset_index()
+    tot["season"] = tot["season"] + 1
+    grid = grid.merge(tot, on=["pitcher", "season"], how="left")
+    return grid
+
+
+# ================================================================== 3. CASES AND MATCHED CONTROLS
+def build_case_control(grid, roles, il_all, birth, season_start):
+    rng = np.random.default_rng(SEED)
+    grid = grid.merge(roles[["pitcher", "season", "role"]], on=["pitcher", "season"], how="left")
+
+    # ---- cases: arm injured-list placements, tied to the pitcher's last outing before the move
+    arm = il_all[il_all["arm_label"] == "arm"][["pitcher_id", "event_date", "injury_text"]].copy()
+    arm["event_date"] = arm["event_date"].astype("datetime64[ns]")
+    apps = grid.loc[grid["appearance"] == 1, ["pitcher", "game_date"]].copy()
+    apps["game_date"] = apps["game_date"].astype("datetime64[ns]")
+    apps = apps.rename(columns={"pitcher": "pitcher_id", "game_date": "index_date"}).sort_values("index_date")
+    ev = pd.merge_asof(arm.sort_values("event_date"), apps, left_on="event_date", right_on="index_date",
+                       by="pitcher_id", direction="backward")
+    ev = ev.dropna(subset=["index_date"])
+    ev = ev[(ev["event_date"] - ev["index_date"]).dt.days <= MAX_GAP_DAYS]
+    ev["season"] = ev["index_date"].dt.year
+    ev = ev[ev["season"].isin(SEASONS)]
+    ev["season_start"] = ev["season"].map(season_start)
+    ev = ev[(ev["index_date"] - ev["season_start"]).dt.days >= MIN_HISTORY_DAYS]
+    ev = ev.drop_duplicates(["pitcher_id", "index_date"]).reset_index(drop=True)
+
+    # ---- candidate controls by date
+    sub = grid[(grid["appearance"] == 1) & grid["pitches_28d"].notna()].copy()
+    sub["age"] = (sub["game_date"] - sub["pitcher"].map(birth)).dt.days / 365.25
+    by_date = {d: g for d, g in sub.groupby("game_date")}
+    role_lookup = roles.set_index(["pitcher", "season"])["role"]
+
+    rows = []
+    set_id = 0
+    for _, e in ev.iterrows():
+        pid, d, season = int(e["pitcher_id"]), e["index_date"], int(e["season"])
+        role = role_lookup.get((pid, season), None)
+        day = by_date.get(d)
+        if role is None or day is None:
+            continue
+        me = day[day["pitcher"] == pid]
+        if me.empty:
+            continue
+        me = me.iloc[0]
+        blocked = set(il_all.loc[(il_all["event_date"] >= d) &
+                                 (il_all["event_date"] <= d + pd.Timedelta(days=IL_CLEAR_DAYS)), "pitcher_id"])
+        cand = day[(day["role"] == role) & (day["pitcher"] != pid) & (~day["pitcher"].isin(blocked))]
+        if len(cand) < MIN_CONTROLS:
+            continue
+        if pd.notna(me["age"]) and cand["age"].notna().any():
+            diff = (cand["age"] - me["age"]).abs().fillna(99.0).to_numpy()
+            order = np.argsort(diff + rng.random(len(diff)) * 1e-6)[:K_CONTROLS]
+        else:
+            order = rng.permutation(len(cand))[:K_CONTROLS]
+        chosen = cand.iloc[order]
+        set_id += 1
+        r = me.to_dict(); r.update(set_id=set_id, injury=1, case_pitcher=pid, event_date=e["event_date"],
+                                   injury_text=e["injury_text"])
+        rows.append(r)
+        for _, c in chosen.iterrows():
+            r = c.to_dict(); r.update(set_id=set_id, injury=0, case_pitcher=pid, event_date=pd.NaT, injury_text=None)
+            rows.append(r)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.rename(columns={"pitcher": "pitcher_id", "game_date": "index_date", "pitches": "pitches_on_index_day"})
+
+    # ---- 3. injury history from the injured-list data (includes the history year)
+    arm_dates = {p: np.sort(g["event_date"].values) for p, g in arm.groupby("pitcher_id")}
+    cnt, since = [], []
+    for pid, d in zip(df["pitcher_id"], df["index_date"]):
+        arr = arm_dates.get(int(pid))
+        if arr is None:
+            cnt.append(0); since.append(np.nan); continue
+        i = int(np.searchsorted(arr, np.datetime64(d), side="left"))
+        cnt.append(i)
+        since.append((d - pd.Timestamp(arr[i - 1])).days if i > 0 else np.nan)
+    df["prior_arm_il_count"] = cnt
+    df["had_prior_arm_il"] = (df["prior_arm_il_count"] > 0).astype(int)
+    df["days_since_prior_arm_il"] = since
+    return df
+
+
+# ================================================================== 4. STATISTICS
+def conditional_logit(X, y, sets, clusters, ridge=1e-4, max_iter=100):
+    """Conditional (matched-set) logistic regression with cluster-robust standard errors.
+    Each set has exactly one case (y=1) and several controls (y=0)."""
+    order = np.argsort(sets, kind="stable")
+    X, y, sets, clusters = X[order], y[order], sets[order], clusters[order]
+    bounds = np.flatnonzero(np.r_[True, sets[1:] != sets[:-1], True])
+    groups = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+    p = X.shape[1]
+
+    def pieces(beta):
+        ll, grad, info, scores = 0.0, np.zeros(p), np.zeros((p, p)), []
+        for a, b in groups:
+            Xs, ys = X[a:b], y[a:b]
+            eta = Xs @ beta
+            m = eta.max()
+            e = np.exp(eta - m)
+            s = e.sum()
+            w = e / s
+            mean = Xs.T @ w
+            xc = Xs[ys == 1][0]
+            ll += eta[ys == 1][0] - m - np.log(s)
+            g = xc - mean
+            grad += g
+            info += (Xs * w[:, None]).T @ Xs - np.outer(mean, mean)
+            scores.append(g)
+        ll -= 0.5 * ridge * beta @ beta
+        grad = grad - ridge * beta
+        info = info + ridge * np.eye(p)
+        return ll, grad, info, np.array(scores)
+
+    beta = np.zeros(p)
+    ll, grad, info, scores = pieces(beta)
+    converged = False
+    for _ in range(max_iter):
+        step = np.linalg.solve(info, grad)
+        t = 1.0
+        while t > 1e-4:
+            ll_new, g2, i2, s2 = pieces(beta + t * step)
+            if ll_new >= ll - 1e-10:
+                break
+            t /= 2
+        else:
+            break
+        beta = beta + t * step
+        ll, grad, info, scores = ll_new, g2, i2, s2
+        if np.max(np.abs(t * step)) < 1e-7:
+            converged = True
+            break
+    V = np.linalg.inv(info)
+    cl = np.array([clusters[a] for a, b in groups])
+    meat = np.zeros((p, p))
+    for c in np.unique(cl):
+        sc_sum = scores[cl == c].sum(axis=0)
+        meat += np.outer(sc_sum, sc_sum)
+    G = len(np.unique(cl))
+    V_rob = V @ meat @ V * (G / max(G - 1, 1))
+    se = np.sqrt(np.clip(np.diag(V_rob), 1e-12, None))
+    z = beta / se
+    pval = 2 * (1 - stats.norm.cdf(np.abs(z)))
+    return {"beta": beta, "se": se, "p": pval, "converged": converged, "n_sets": len(groups)}
+
+
+def prepare_model_data(df, feats):
+    d = df.dropna(subset=feats).copy()
+    sizes = d.groupby("set_id")["injury"].agg(["sum", "size"])
+    ok = sizes[(sizes["sum"] == 1) & (sizes["size"] >= 2)].index
+    return d[d["set_id"].isin(ok)].copy()
+
+
+def fit_matched_model(d, feats):
+    mu, sd = d[feats].mean(), d[feats].std(ddof=0).replace(0, np.nan)
+    Z = ((d[feats] - mu) / sd).fillna(0.0).to_numpy(dtype=float)
+    res = conditional_logit(Z, d["injury"].to_numpy(dtype=int), d["set_id"].to_numpy(),
+                            d["case_pitcher"].to_numpy())
+    out = pd.DataFrame({"feature": feats, "odds_ratio_per_1SD": np.exp(res["beta"]),
+                        "ci_low": np.exp(res["beta"] - 1.96 * res["se"]),
+                        "ci_high": np.exp(res["beta"] + 1.96 * res["se"]),
+                        "p_value": res["p"]})
+    out["p_bonferroni"] = np.minimum(out["p_value"] * len(feats), 1.0)
+    return out, res
+
+
+def fit_mixed_effects(d, feats):
+    """Logistic model with a random intercept for each pitcher (variational Bayes)."""
+    from statsmodels.genmod.bayes_mixed_glm import BinomialBayesMixedGLM
+    mu, sd = d[feats].mean(), d[feats].std(ddof=0).replace(0, np.nan)
+    Z = ((d[feats] - mu) / sd).fillna(0.0)
+    data = Z.copy()
+    data["injury"] = d["injury"].to_numpy()
+    data["pitcher_id"] = d["pitcher_id"].astype(str).to_numpy()
+    model = BinomialBayesMixedGLM.from_formula("injury ~ " + " + ".join(feats),
+                                               {"pitcher": "0 + C(pitcher_id)"}, data)
+    fit = model.fit_vb()
+    names = list(model.exog_names)
+    out = pd.DataFrame({"term": names, "coef_mean": fit.fe_mean, "coef_sd": fit.fe_sd})
+    out["approx_z"] = out["coef_mean"] / out["coef_sd"]
+    out["odds_ratio_per_1SD"] = np.exp(out["coef_mean"])
+    return out
+
+
+def describe_pairs(df, features):
+    rows = []
+    cases = df[df["injury"] == 1].set_index("set_id")
+    ctrl = df[df["injury"] == 0].groupby("set_id")
+    for f in features:
+        if f not in df:
+            continue
+        diff = (cases[f] - ctrl[f].mean()).dropna()
+        cv = cases[f].dropna()
+        kv = df.loc[df["injury"] == 0, f].dropna()
+        p = np.nan
+        if len(diff) >= 10 and (diff != 0).any():
+            try:
+                p = stats.wilcoxon(diff).pvalue
+            except Exception:
+                pass
+        rows.append({"feature": f, "injured_mean": cv.mean(), "healthy_mean": kv.mean(),
+                     "injured_median": cv.median(), "healthy_median": kv.median(),
+                     "avg_paired_difference": diff.mean(), "pct_of_sets_injured_higher": (diff > 0).mean() * 100,
+                     "n_pairs": len(diff), "p_value_wilcoxon": p})
+    return pd.DataFrame(rows)
+
+
+def validate_by_season(d, feats):
+    """7. Train on two seasons, test on the held-out season."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+    rows = []
+    seasons = sorted(d["season"].unique())
+    if len(seasons) < 2:
+        return pd.DataFrame()
+    for s in seasons:
+        tr, te = d[d["season"] != s], d[d["season"] == s]
+        if tr["injury"].sum() < 20 or te["injury"].sum() < 10:
+            continue
+        mu, sd = tr[feats].mean(), tr[feats].std(ddof=0).replace(0, np.nan)
+        Xtr, Xte = ((tr[feats] - mu) / sd).fillna(0.0), ((te[feats] - mu) / sd).fillna(0.0)
+        clf = LogisticRegression(C=1.0, max_iter=2000).fit(Xtr, tr["injury"])
+        te = te.assign(p=clf.predict_proba(Xte)[:, 1])
+        auc = roc_auc_score(te["injury"], te["p"])
+        hit = te.groupby("set_id").apply(lambda g: float(g.loc[g["p"].idxmax(), "injury"] == 1))
+        base = te.groupby("set_id")["injury"].apply(lambda g: 1.0 / len(g))
+        rows.append({"held_out_season": s, "train_cases": int(tr["injury"].sum()), "test_cases": int(te["injury"].sum()),
+                     "AUC_(0.5=coin_flip)": auc, "case_ranked_riskiest_%": hit.mean() * 100,
+                     "chance_level_%": base.mean() * 100})
+    return pd.DataFrame(rows)
+
+
+def season_consistency(d, feats):
+    """Does each variable point the same way in every season?"""
+    cols = {}
+    for s in sorted(d["season"].unique()):
+        ds = prepare_model_data(d[d["season"] == s], feats)
+        if ds["injury"].sum() < 15:
+            continue
+        try:
+            _, res = fit_matched_model(ds, feats)
+            cols[f"coef_{s}"] = res["beta"]
+        except Exception:
+            continue
+    if len(cols) < 2:
+        return pd.DataFrame()
+    t = pd.DataFrame(cols, index=feats)
+    t["same_direction_all_seasons"] = (np.sign(t).nunique(axis=1) == 1)
+    return t.reset_index().rename(columns={"index": "feature"})
+
+
+# ================================================================== 5. RUN
+def run_study(sc, il_all, birth, result_dir=RESULT_DIR):
+    os.makedirs(result_dir, exist_ok=True)
+    roles = make_roles(sc)
+    season_start = sc.groupby("season")["game_date"].min()
+    print("Building daily workload table ...")
+    grid = build_daily_grid(sc)
+    print(f"  daily table rows: {len(grid):,}")
+    print("Matching injured pitchers to healthy controls ...")
+    df = build_case_control(grid, roles, il_all, birth, season_start)
+    if df.empty:
+        print("No usable injury cases found. Check dates and the injured-list file.")
+        return
+    df.to_csv(os.path.join(result_dir, "case_control_dataset.csv"), index=False)
+
+    lines = ["MLB PITCHER WORKLOAD AND ARM-INJURY STUDY: SUMMARY", "=" * 56,
+             f"Seasons: {[int(x) for x in sorted(df['season'].unique())]}",
+             f"Matched sets: {df['set_id'].nunique()} (1 injured pitcher + up to {K_CONTROLS} healthy pitchers who",
+             "pitched on the same date, in the same role, closest in age).",
+             "All workload numbers are measured BEFORE the injured pitcher's last outing.", ""]
+    desc_all, model_all, mixed_all, val_all, cons_all = [], [], [], [], []
+
+    for role in ["Starter", "Reliever"]:
+        dr = df[df["role"] == role]
+        n_cases = int(dr["injury"].sum())
+        lines.append(f"{role.upper()}S: {n_cases} arm-injured pitchers")
+        if n_cases < 15:
+            lines.append("  Too few injuries for reliable models. Skipped.\n")
+            continue
+        dd = describe_pairs(dr, CORE_FEATURES + ["fb_velo_change_mph"] + DESCRIBE_EXTRA)
+        dd.insert(0, "role", role)
+        desc_all.append(dd)
+        for set_name, feats in FEATURE_SETS.items():
+            usable = [f for f in feats if dr[f].notna().mean() >= 0.7]
+            dropped = [f for f in feats if f not in usable]
+            if dropped:
+                lines.append(f"  ({set_name}) dropped for too much missing data: {dropped}")
+            if len(usable) < 3:
+                continue
+            d = prepare_model_data(dr, usable)
+            if d["injury"].sum() < 15:
+                lines.append(f"  ({set_name}) too few complete cases.")
+                continue
+            try:
+                coefs, res = fit_matched_model(d, usable)
+            except Exception as err:
+                lines.append(f"  ({set_name}) matched model failed: {err}")
+                continue
+            coefs.insert(0, "model", set_name); coefs.insert(0, "role", role)
+            coefs["n_injured"] = int(d["injury"].sum())
+            model_all.append(coefs)
+            sig = coefs[coefs["p_value"] < 0.05]
+            lines.append(f"  Model {set_name}: {int(d['injury'].sum())} injured pitchers with complete data")
+            if sig.empty:
+                lines.append("    No variable was clearly linked to injury (all p >= 0.05).")
+            for _, r in sig.iterrows():
+                way = "HIGHER" if r["odds_ratio_per_1SD"] > 1 else "LOWER"
+                strong = "survives" if r["p_bonferroni"] < 0.05 else "does NOT survive"
+                lines.append(f"    {r['feature']}: injury odds {way} (x{r['odds_ratio_per_1SD']:.2f} per 1 SD, "
+                             f"p={r['p_value']:.3f}; {strong} the multiple-testing correction)")
+            try:
+                mm = fit_mixed_effects(d, usable)
+                mm.insert(0, "model", set_name); mm.insert(0, "role", role)
+                mixed_all.append(mm)
+            except Exception as err:
+                lines.append(f"    (mixed-effects model skipped: {err})")
+            v = validate_by_season(d, usable)
+            if not v.empty:
+                v.insert(0, "model", set_name); v.insert(0, "role", role)
+                val_all.append(v)
+                lines.append("    Held-out season test: " + "; ".join(
+                    f"{int(r['held_out_season'])}: AUC {r['AUC_(0.5=coin_flip)']:.2f}" for _, r in v.iterrows()))
+            c = season_consistency(d, usable)
+            if not c.empty:
+                c.insert(0, "model", set_name); c.insert(0, "role", role)
+                cons_all.append(c)
+        lines.append("")
+
+    def save(frames, name):
+        if frames:
+            pd.concat(frames, ignore_index=True).to_csv(os.path.join(result_dir, name), index=False)
+
+    save(desc_all, "descriptive_comparison.csv")
+    save(model_all, "model_matched_logistic.csv")
+    save(mixed_all, "model_mixed_effects.csv")
+    save(val_all, "season_validation.csv")
+    save(cons_all, "season_consistency.csv")
+    pd.DataFrame([
+        ("pitches_7d/14d/21d/28d", "Pitches in the 7/14/21/28 days before the index date (index day excluded)"),
+        ("hv_pitches_14d", "Pitches at or above 95 mph in the prior 14 days"),
+        ("acwr_7d_28d", "Spike ratio: last 7 days vs the weekly average of the last 28 days (1.0 = normal; 1.5 = 50% spike)"),
+        ("acwr_14d_28d", "Same idea using the last 14 days"),
+        ("workload_change_28d / _pct", "Last 28 days minus the 28 days before that (needs 56 days of history)"),
+        ("avg_pitches_per_outing_28d", "Average pitches per appearance in the last 28 days"),
+        ("days_since_last_appearance", "Days of rest since the previous outing"),
+        ("season_pitches_to_date", "Pitches thrown so far this season"),
+        ("prev_season_pitches", "Pitches thrown last season (blank for the first season)"),
+        ("age", "Age on the index date (from MLB Stats API birth dates)"),
+        ("prior_arm_il_count / had_prior_arm_il", "Earlier arm injured-list placements in the data (starts the year before the first season)"),
+        ("fb_velo_change_mph", "Average fastball speed over the last 14 days minus days 15-45 before (negative = slowing down)"),
+        ("pitches_on_index_day", "Pitches in the final outing. For information only: NOT used in models, because the injury may have happened in it"),
+        ("injury", "1 = pitcher who went on the IL with an arm injury; 0 = matched healthy pitcher"),
+        ("set_id", "Group of one injured pitcher plus his matched healthy pitchers"),
+    ], columns=["field", "meaning"]).to_csv(os.path.join(result_dir, "data_dictionary.csv"), index=False)
+
+    lines += ["READING THE RESULTS",
+              "- Odds ratio above 1 = higher injury odds when that variable is higher; below 1 = lower odds.",
+              "- 'Per 1 SD' means one typical step up for that variable (so variables can be compared).",
+              "- A correlation is not proof of cause. Injured pitchers may already be affected before the IL move.",
+              "- AUC 0.5 = no better than guessing; 0.6 weak; 0.7 reasonable. Check season_validation.csv.",
+              "- Injury labels come from keyword rules on IL text. Review ambiguous and unspecified cases by hand."]
+    text = "\n".join(lines)
+    with open(os.path.join(result_dir, "summary.txt"), "w", encoding="utf-8") as f:
+        f.write(text)
+    print("\n" + text)
+    print(f"\nAll files saved in: {os.path.abspath(result_dir)}")
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for y in SEASONS:
+        print(f"Checking Statcast {y} (saved weeks are skipped) ...")
+        pull_statcast_season(y)
+    sc = load_statcast()
+    print(f"MLB regular-season pitches loaded: {len(sc):,}")
+    il_all = load_injuries()
+    print(f"MLB injured-list placements loaded: {len(il_all):,}")
+    birth = get_birthdates(sc["pitcher"].unique())
+    print(f"Birth dates found for {len(birth):,} players")
+    run_study(sc, il_all, birth)
+
+
+if __name__ == "__main__":
+    main()
